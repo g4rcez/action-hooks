@@ -2,8 +2,8 @@
 import { AppRouterInstance } from "next/dist/shared/lib/app-router-context.shared-runtime";
 import { useRouter } from "next/navigation";
 import { useReducer } from "../use-typed-reducer";
-import { useEffect } from "react";
-import useSWR from "swr";
+import { useEffect, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 
 type Counter = (c: number) => number;
 
@@ -26,19 +26,17 @@ const loggerPlugin =
 
 const middleware = [loggerPlugin("useComponentState")];
 
-const fetcher = (url: string) => fetch(url).then(res => res.json())
+const fetcher = (url: string) => fetch(url).then((res) => res.json());
 
-const useRequest = <T extends object>(url: string, initialShape: T) => {
-  const { data } = useSWR(url, fetcher);
-  return data || initialShape;
-};
+const API_URL = "https://restcountries.com/v3.1/all";
 
 const useComponentState = (router: AppRouterInstance) => {
-  const response = useRequest<any[]>(
-    "https://restcountries.com/v3.1/all?fields",
-    [],
-  );
-  const [state, reducer] = useReducer(
+  const query = useQuery({
+    queryKey: ["countries"],
+    queryFn: () => fetcher(API_URL),
+  });
+
+  return useReducer(
     { count: 0, name: "", countries: [] as any[] },
     (get) => {
       const fn = (op: Counter) => {
@@ -46,27 +44,24 @@ const useComponentState = (router: AppRouterInstance) => {
         get.props().router.push(`/?count=${count}`);
         return { count };
       };
-
       return {
         onChange,
-        countries: (countries: any[]) => ({ countries }),
         dec: () => fn((x) => x - 1),
         inc: (_: React.MouseEvent<HTMLButtonElement>) => fn((x) => x + 1),
       };
     },
-    { router },
+    { router, countries: query.data ?? [] },
     middleware,
   );
-
-  useEffect(() => {
-    reducer.countries(response);
-  }, [response]);
-
-  return [state, reducer] as const;
 };
 
 export default function Local() {
-  const [state, reducer] = useComponentState(useRouter());
+  const [counter, setCounter] = useState(0);
+  const [state, reducer, props] = useComponentState(useRouter());
+
+  useEffect(() => {
+    setCounter((c) => c + 1);
+  }, [state]);
 
   return (
     <main className="flex flex-col gap-8 justify-between items-center p-8">
@@ -82,7 +77,8 @@ export default function Local() {
         onChange={reducer.onChange}
         value={state.name}
       />
-      <p>Countries: {state.countries.length}</p>
+      <p>Countries: {props.countries.length}</p>
+      <p>{counter}</p>
     </main>
   );
 }
