@@ -1,5 +1,6 @@
-import {
+import React, {
   MutableRefObject,
+  SetStateAction,
   useCallback,
   useEffect,
   useMemo,
@@ -43,6 +44,7 @@ export type ReducerArgs<State extends {}, Props extends object> = {
   state: () => State;
   props: () => Props;
   initialState: State;
+  previousState: () => State;
 };
 
 export type FnMap<State> = {
@@ -69,24 +71,12 @@ export type UseReducer<
 > = readonly [
   state: Selector,
   dispatchers: MapReducerReturn<State, ReturnType<Reducers>>,
-  props: Props,
 ];
-
-type ParseStr<T> = T extends string ? T : never;
 
 export type ReducerMiddleware<
   State extends object,
   Props extends object,
-  Reducers extends (
-    args: ReducerArgs<State, Props>,
-  ) => MappedReducers<State, FnMap<State>>,
-> = Array<
-  (
-    state: State,
-    key: ParseStr<keyof ReturnType<Reducers>> | string,
-    prev: State,
-  ) => State
->;
+> = Array<(state: State, prev: State, debug: Debug<Props>) => State>;
 
 export type Callback<T> = T | ((prev: T) => T);
 
@@ -102,26 +92,6 @@ export const entries = <T extends {}, F>(t: T): MapArray<T[], F> =>
 
 export const isPromise = <T>(promise: any): promise is Promise<T> =>
   promise instanceof Promise;
-
-// https://gist.github.com/ahtcx/0cd94e62691f539160b32ecda18af3d6?permalink_comment_id=2930530#gistcomment-2930530
-export const merge = <T>(currentState: T, previous: T) => {
-  if (!isObject(previous) || !isObject(currentState)) {
-    return currentState;
-  }
-  keys(currentState).forEach((key) => {
-    const targetValue = previous[key];
-    const sourceValue = currentState[key];
-    if (Array.isArray(targetValue) && Array.isArray(sourceValue))
-      return ((previous as any)[key] = targetValue.concat(sourceValue));
-    if (isObject(targetValue) && isObject(sourceValue))
-      return (previous[key] = merge(
-        Object.assign({}, targetValue),
-        sourceValue,
-      ));
-    return (previous[key] = sourceValue);
-  });
-  return previous;
-};
 
 export const isPrimitive = (a: any): a is string | number | boolean => {
   const type = typeof a;
@@ -175,7 +145,7 @@ export const shallowCompare = (left: any, right: any): boolean => {
 export const clone = <O>(instance: O) =>
   Object.assign(Object.create(Object.getPrototypeOf(instance)), instance);
 
-export const useTypedReducer = <
+export const useLegacyReducer = <
   State extends {},
   Reducers extends Dispatch<State, Props, Reducers>,
   Props extends {},
@@ -218,105 +188,150 @@ export const dispatchCallback = <Prev extends any, T extends Callback<Prev>>(
   setter: T,
 ) => (typeof setter === "function" ? setter(prev) : setter);
 
-const reduce = <
-  State extends {},
-  Middlewares extends Array<(state: State, key: string, prev: State) => State>,
->(
-  state: State,
-  prev: State,
-  middleware: Middlewares,
-  key: string,
-) => {
-  let initial = state;
-  if (prev !== state) {
-    if (state.constructor.name === Object.name) {
-      initial = { ...prev, ...state };
-    }
-  }
-  return middleware.reduce<State>((acc, middle) => {
-    console.log(middle);
-    return middle(acc, key, prev);
-  }, initial);
+const reduce = <State extends {}>(state: State, prev: State) => {
+  if (prev === state) return state;
+  return state.constructor.name === Object.name ? { ...prev, ...state } : state;
 };
 
+function usePrevious<V>(value: V): V {
+  const ref = useRef<V>();
+  useEffect(() => {
+    ref.current = value;
+  }, [value]);
+  return ref.current!;
+}
+
 const noopObject = {};
+
+type Debug<Props extends object = {}> = {
+  method: string;
+  time: Date | number;
+  props: Props;
+};
+
+const debugFunc =
+  <State extends {}, Props extends object>(
+    name: string,
+    dispatch: (...args: any[]) => any,
+    setState: React.Dispatch<SetStateAction<State>>,
+    getProps: () => Props,
+    debug: React.MutableRefObject<Debug<Props> | null>,
+  ) =>
+  (...params: any[]) => {
+    const now = performance.now();
+    const result = dispatch(...params);
+    const set = (newState: State) => setState((prev) => reduce(newState, prev));
+    if (isPromise<State>(result)) {
+      return result.then((resolved) => {
+        set(resolved);
+        debug.current = {
+          method: name,
+          props: getProps(),
+          time: performance.now() - now,
+        };
+      });
+    }
+    set(result);
+    debug.current = {
+      method: name,
+      props: getProps(),
+      time: performance.now() - now,
+    };
+  };
+
+const optimizedFunc =
+  <State extends {}, Props extends object>(
+    name: string,
+    dispatch: (...args: any[]) => any,
+    setState: React.Dispatch<SetStateAction<State>>,
+    getProps: () => Props,
+    debug: React.MutableRefObject<Debug<Props> | null>,
+  ) =>
+  (...params: any[]) => {
+    debug.current = { method: name, time: 0, props: getProps() };
+    const result = dispatch(...params);
+    const set = (newState: State) => setState((prev) => reduce(newState, prev));
+    if (isPromise<State>(result)) {
+      return result.then((resolved) => set(resolved));
+    }
+    return set(result);
+  };
 
 export const useReducer = <
   State extends {},
   Reducers extends ReducerActions<State, Props>,
   Props extends object,
-  Middlewares extends ReducerMiddleware<State, Props, Reducers>,
+  Middlewares extends ReducerMiddleware<State, Props>,
+  UseDebug extends boolean,
 >(
   initialState: State,
   reducer: Reducers,
-  props?: Props,
-  middlewares?: Middlewares,
+  options?: Partial<{
+    middlewares: Middlewares;
+    props: Props;
+    debug: UseDebug;
+  }>,
 ): UseReducer<State, State, Props, Reducers> => {
   const [state, setState] = useState<State>(() => initialState);
   const mutableState = useMutable(state);
-  const mutableProps = useMutable(props ?? ({} as Props));
+  const mutableProps = useMutable(options?.props ?? ({} as Props));
   const mutableReducer = useMutable(reducer);
   const middleware = useMutable<Middlewares>(
-    middlewares ?? ([] as unknown as Middlewares),
+    options?.middlewares ?? ([] as unknown as Middlewares),
   );
   const savedInitialState = useRef(initialState);
+  const previous = usePrevious(state);
+  const previousRef = useMutable(previous);
+  const debug = useRef<Debug<Props> | null>(null);
+
+  useEffect(() => {
+    if (debug.current === null) return;
+    const d = debug.current!;
+    middleware.current.forEach((middle) => {
+      middle(state, previous, d);
+    });
+  }, [state, middleware, previous]);
 
   const [dispatchers] = useState<MapReducerReturn<State, ReturnType<Reducers>>>(
     () => {
+      const getProps = () => mutableProps.current;
       const reducers = mutableReducer.current({
+        props: getProps,
         state: () => mutableState.current,
-        props: () => mutableProps.current,
         initialState: savedInitialState.current,
+        previousState: () => previousRef.current,
       });
       return entries<string, any>(reducers as any).reduce(
         (acc, [name, dispatch]: any) => ({
           ...acc,
-          [name]: (...params: any[]) => {
-            const result = dispatch(...params);
-            const set = (newState: State) =>
-              setState((prev) =>
-                reduce(newState, prev, middleware.current, name),
-              );
-            return isPromise<State>(result)
-              ? void result.then(set)
-              : set(result);
-          },
+          [name]: options?.debug
+            ? debugFunc(name, dispatch, setState, getProps, debug)
+            : optimizedFunc(name, dispatch, setState, getProps, debug),
         }),
         {} as MapReducerReturn<State, ReturnType<Reducers>>,
       );
     },
   );
-  return [state, dispatchers, props ?? (noopObject as Props)] as const;
+  return [state, dispatchers] as const;
 };
-
-export const createReducer =
-  <State extends {} = {}, Props extends object = {}>() =>
-  <
-    Reducer extends (
-      args: ReducerArgs<State, Props>,
-    ) => MappedReducers<State, FnMap<State>>,
-  >(
-    reducer: Reducer,
-  ) =>
-    reducer;
 
 export const createGlobalReducer = <
   State extends {},
-  Reducers extends ReducerActions<State, Props>,
-  Props extends object,
-  Middlewares extends ReducerMiddleware<State, Props, Reducers>,
+  Reducers extends ReducerActions<State, {}>,
 >(
   initialState: State,
   reducer: Reducers,
-  props?: Props,
-  middlewares?: Middlewares,
-): (<Selector extends (state: State) => any>(
+): (<
+  Selector extends (state: State) => any,
+  Middlewares extends ReducerMiddleware<State, {}>,
+>(
   selector?: Selector,
   comparator?: (a: any, b: any) => boolean,
+  middleware?: Middlewares,
 ) => UseReducer<
   Selector extends (state: State) => State ? State : ReturnType<Selector>,
   State,
-  Props,
+  {},
   Reducers
 >) & {
   dispatchers: MapReducerReturn<State, ReturnType<Reducers>>;
@@ -335,10 +350,13 @@ export const createGlobalReducer = <
     listeners.forEach((exec) => exec(newState, previousState));
   };
 
-  const getProps = () => (props as Props) || (noopObject as Props);
-  const args = { state: getSnapshot, props: getProps, initialState };
-  const middlewareList: Middlewares =
-    middlewares || ([] as unknown as Middlewares);
+  const args = {
+    initialState,
+    props: {} as any,
+    state: getSnapshot,
+    previousState: getSnapshot,
+  };
+
   const dispatchers: MapReducerReturn<State, ReturnType<Reducers>> = entries(
     reducer(args),
   ).reduce<any>(
@@ -347,7 +365,7 @@ export const createGlobalReducer = <
       [name]: (...args: any[]) => {
         const result = fn(...args);
         const set = (newState: State) =>
-          setState((prev) => reduce(newState, prev, middlewareList, name));
+          setState((prev) => reduce(newState, prev));
         return isPromise<State>(result) ? result.then(set) : set(result);
       },
     }),
@@ -357,9 +375,13 @@ export const createGlobalReducer = <
   const defaultSelector = (state: State) => state;
 
   return Object.assign(
-    function useStore<Selector extends (state: State) => any>(
+    function useStore<
+      Selector extends (state: State) => any,
+      Middlewares extends ReducerMiddleware<State, {}>,
+    >(
       selector?: Selector,
       comparator = shallowCompare,
+      middleware?: Middlewares,
     ) {
       const state = useSyncExternalStoreWithSelector(
         addListener,
@@ -368,26 +390,43 @@ export const createGlobalReducer = <
         selector || defaultSelector,
         comparator,
       );
-      return [state, dispatchers, noopObject as Props] as const;
+      const previous = usePrevious(state);
+      useEffect(() => {
+        if (!middleware) return;
+        middleware.forEach((middle) => {
+          middle(state, previous, { method: "@globalState@", time: -1, props: {} });
+        });
+      }, [state, previous]);
+      return [state, dispatchers] as const;
     },
     { dispatchers },
   );
 };
 
-export const useClassReducer = <T extends object>(instance: T) => {
-  const [proxy, setProxy] = useState(
-    new Proxy(
-      instance,
-      Object.assign({}, Reflect, {
-        set: (obj: any, prop: any, value: any) => {
-          (obj as any)[prop] = value;
-          setProxy(clone(obj));
-          return true;
-        },
-      }),
-    ),
-  );
-  return proxy;
-};
+export const logger =
+  (groupName: string) =>
+  <State, Props extends object>(
+    state: State,
+    prev: State,
+    debug: Debug<Props>,
+  ) => {
+    console.group(groupName);
+    console.info(
+      `%cAction %c- "${debug.method}" ${debug.time}ms\n`,
+      "color: gold",
+      "color: white",
+      prev,
+    );
+    console.info("%cPrevious state\n", "color: silver", prev);
+    console.info("%cCurrent state\n", "color: green", state);
+    console.info("Props\n", debug.props);
+    console.groupEnd();
+    return state;
+  };
 
-export default useTypedReducer;
+export const storage =
+  (name: string, storage: typeof sessionStorage | typeof localStorage) =>
+  <State>(state: State) => {
+    storage.setItem(name, JSON.stringify(state));
+    return state;
+  };
